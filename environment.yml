@@ -1,0 +1,25 @@
+name: land-cover
+channels:
+  - conda-forge
+  - defaults
+  - pytorch
+dependencies:
+  - python=3.8
+  - cudatoolkit=11.1
+  - pytorch
+  - torchvision
+  - pytorch-lightning
+  - geopandas
+  - dask
+  - pip
+  - pip:
+      - jupyterlab
+      - scikit-learn
+      - albumentations
+      - torchmetrics
+      - seaborn
+      - isort
+      - black
+      - flake8
+      - pytest
+      - pre-commit
