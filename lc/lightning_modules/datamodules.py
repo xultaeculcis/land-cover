@@ -2,7 +2,6 @@
 import logging
 import os
 from argparse import ArgumentParser
-from glob import glob
 from typing import Dict, Optional, Union, Tuple
 
 import albumentations as a
@@ -10,6 +9,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
+import torch
 import torchvision
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
@@ -21,12 +21,13 @@ os.environ["NUMEXPR_MAX_THREADS"] = "16"
 
 
 class LandCoverDataset(Dataset):
-    def __init__(self, images, masks, augmentations, stage):
+    def __init__(self, images, masks, augmentations, stage, pixel_mapping):
         self.images = images
         self.masks = masks
         self.augmentations = augmentations
         self.stage = stage
         self.common_transform = torchvision.transforms.ToTensor()
+        self.pixel_mapping = pixel_mapping
 
     def __getitem__(self, index) -> Dict[str, Union[Tensor, list]]:
         image = self._read_image(self.images[index])
@@ -39,33 +40,35 @@ class LandCoverDataset(Dataset):
 
         return {
             "image": self.common_transform(image),
-            "mask": self.common_transform(mask).long(),
+            "mask": torch.from_numpy(mask),
         }
 
     def __len__(self) -> int:
         return len(self.images)
 
-    @staticmethod
-    def _read_mask(label_path: str) -> np.ndarray:
+    def _read_mask(self, label_path: str) -> np.ndarray:
         mask = cv2.imread(
             label_path, cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR
         )
         mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
 
-        if len(mask.shape) != 2:
-            raise RuntimeError(f"The shape of label must be (H, W). Got: {mask.shape}")
+        for k, v in self.pixel_mapping.items():
+            mask[mask == v] = k
 
-        return mask.astype(np.int32)
+        assert (
+            len(mask.shape) == 2
+        ), f"The shape of label must be (H, W). Got: {mask.shape}"
+
+        return mask.astype(np.int64)
 
     @staticmethod
     def _read_image(image_path: str) -> np.ndarray:
         img = cv2.imread(image_path, cv2.IMREAD_COLOR)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        if len(img.shape) != 3:
-            raise RuntimeError(
-                f"The shape of image must be (H, W, C). Got: {img.shape}"
-            )
+        assert (
+            len(img.shape) == 3
+        ), f"The shape of image must be (H, W, C). Got: {img.shape}"
 
         return img
 
@@ -95,21 +98,49 @@ class LandCoverDataModule(pl.LightningDataModule):
             + self.class_dict_df["b"] * 114 / 1000,
             0,
         ).astype(int, copy=False)
+        self.class_dict_df = self.class_dict_df.sort_values("pixel_value").reset_index(
+            drop=True
+        )
+        self.class_dict_df["idx"] = self.class_dict_df.index
+        self.pixel_mapping = dict(
+            self.class_dict_df[["idx", "pixel_value"]].values.tolist()
+        )
+        self.reverse_mapping = {v: k for k, v in self.pixel_mapping.items()}
 
-        train_images = sorted(glob(os.path.join(self.data_path, "train/*.jpg")))
-        train_masks = sorted(glob(os.path.join(self.data_path, "train/*.png")))
+        train_df = pd.read_csv(os.path.join(self.data_path, "train.csv"))
+        val_df = pd.read_csv(os.path.join(self.data_path, "val.csv"))
 
-        val_images = sorted(glob(os.path.join(self.data_path, "valid/*.jpg")))
-        val_masks = sorted(glob(os.path.join(self.data_path, "valid/*.png")))
+        train_images = sorted(
+            [
+                os.path.join(self.data_path, fp)
+                for fp in train_df["sat_image_path"].values.tolist()
+            ]
+        )
+        train_masks = sorted(
+            [
+                os.path.join(self.data_path, fp)
+                for fp in train_df["mask_path"].values.tolist()
+            ]
+        )
 
-        test_images = sorted(glob(os.path.join(self.data_path, "test/*.jpg")))
-        test_masks = sorted(glob(os.path.join(self.data_path, "test/*.png")))
+        val_images = sorted(
+            [
+                os.path.join(self.data_path, fp)
+                for fp in val_df["sat_image_path"].values.tolist()
+            ]
+        )
+        val_masks = sorted(
+            [
+                os.path.join(self.data_path, fp)
+                for fp in val_df["mask_path"].values.tolist()
+            ]
+        )
 
         logging.info(
-            f"Train/Validation/Test split sizes (images): {len(train_images)}/{len(val_images)}/{len(test_images)}"
+            f"Train/Validation split sizes (images): {len(train_images)}/{len(val_images)}"
         )
         logging.info(
-            f"Train/Validation/Test split sizes (masks): {len(train_masks)}/{len(val_masks)}/{len(test_masks)}"
+            f"Train/Validation split sizes (masks): {len(train_masks)}/{len(val_masks)}"
         )
 
         self.train_dataset = LandCoverDataset(
@@ -124,6 +155,7 @@ class LandCoverDataModule(pl.LightningDataModule):
                 ]
             ),
             stage="train",
+            pixel_mapping=self.pixel_mapping,
         )
 
         self.val_dataset = LandCoverDataset(
@@ -135,17 +167,7 @@ class LandCoverDataModule(pl.LightningDataModule):
                 ]
             ),
             stage="val",
-        )
-
-        self.test_dataset = LandCoverDataset(
-            images=test_images,
-            masks=test_masks,
-            augmentations=a.Compose(
-                [
-                    a.CenterCrop(height=self.resize_height, width=self.resize_width),
-                ]
-            ),
-            stage="test",
+            pixel_mapping=self.pixel_mapping,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -159,14 +181,6 @@ class LandCoverDataModule(pl.LightningDataModule):
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-        )
-
-    def test_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,

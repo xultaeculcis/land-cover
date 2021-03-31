@@ -30,6 +30,7 @@ class LandCoverLightningModule(pl.LightningModule):
 
         # metrics
         self.iou_train = metrics.Iou(num_classes=self.hparams.num_classes)
+        self.iou_val = metrics.Iou(num_classes=self.hparams.num_classes)
 
     def build_model(self) -> nn.Module:
         if self.hparams.architecture == "unet":
@@ -43,31 +44,47 @@ class LandCoverLightningModule(pl.LightningModule):
         return self.model(x)
 
     def training_step(self, batch: Any, batch_idx: int) -> Any:
-        image, mask = (
-            batch["image"],
-            batch["mask"],
-        )
-
+        image, mask = batch["image"], batch["mask"]
         preds = self(image)
-
         loss = self.loss(preds, mask)
-
+        preds = preds.argmax(dim=1)
         self.iou_train(preds, mask)
-
         self.log("train/loss", loss, on_step=True, on_epoch=False)
-
         return loss
+
+    def validation_step(
+        self, batch: Any, batch_idx: int
+    ) -> Dict[str, Union[float, int]]:
+        image, mask = batch["image"], batch["mask"]
+        preds = self(image)
+        loss = self.loss(preds, mask)
+        preds = preds.argmax(dim=1)
+        self.iou_val(preds, mask)
+        return {"val/loss": loss}
 
     def training_epoch_end(self, outputs: List[Any]) -> None:
         # Compute and log metrics across epoch
         metrics_avg = self.iou_train.compute()
-        self.log("hp_metric", metrics_avg.miou)
         self.log("train/mIoU", metrics_avg.miou)
         self.log("train/accuracy", metrics_avg.accuracy.mean())
         self.log("train/precision", metrics_avg.precision.mean())
         self.log("train/recall", metrics_avg.recall.mean())
         self.log("train/specificity", metrics_avg.specificity.mean())
         self.iou_train.reset()
+
+    def validation_epoch_end(self, outputs: List[Any]):
+        # Compute and log metrics across epoch
+        loss_mean = torch.stack([output["val/loss"] for output in outputs]).mean()
+
+        metrics_avg = self.iou_val.compute()
+        self.log("val/loss", loss_mean)
+        self.log("hp_metric", metrics_avg.miou)
+        self.log("val/mIoU", metrics_avg.miou)
+        self.log("val/accuracy", metrics_avg.accuracy.mean())
+        self.log("val/precision", metrics_avg.precision.mean())
+        self.log("val/recall", metrics_avg.recall.mean())
+        self.log("val/specificity", metrics_avg.specificity.mean())
+        self.iou_val.reset()
 
     def configure_optimizers(
         self,
@@ -98,7 +115,7 @@ class LandCoverLightningModule(pl.LightningModule):
         )
         parser.add_argument(
             "--pct_start",
-            default=0.05,
+            default=0.3,
             type=Union[float, int],
             help="The percentage of the cycle (in number of steps) spent increasing the learning rate",
         )
